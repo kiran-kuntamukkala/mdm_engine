@@ -1,0 +1,5 @@
+mdm_engine_deployment_version=2026-09-02
+mdm_engine_build=priority-one-row-per-source
+mdm_engine_catalog=mdm
+mdm_engine_priority_order=crm_customers,banking_customers,creditcard_customers
+mdm_engine_status=updated
