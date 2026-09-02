@@ -17,7 +17,7 @@ def build_mdm_temp_table(spark: SparkSession, source_table: str, target_table: s
         rows = build_mdm_temp(df, source_system=source_system, entity_type=entity_type)
         if not rows:
             logger.warning("No MDM temp records generated for %s", source_table)
-            return spark.createDataFrame([], schema="record_id STRING, source_system STRING, entity_type STRING, attribute_name STRING, attribute_value STRING, load_timestamp STRING")
+            return spark.createDataFrame([], schema="record_id STRING, source_system STRING, entity_type STRING, load_timestamp STRING")
 
         out_df = spark.createDataFrame(rows)
         out_df.write.mode("overwrite").saveAsTable(target_table)
