@@ -95,27 +95,38 @@ def get_table_metadata(df: DataFrame) -> List[Dict[str, str]]:
     return [{"column_name": col, "data_type": str(df.schema[col].dataType)} for col in df.columns]
 
 
+def normalize_record(record: Dict[str, Any], source_system: str, entity_type: str) -> Dict[str, Any]:
+    """Convert a source record into a single canonical MDM temp row."""
+    normalized: Dict[str, Any] = {
+        "record_id": str(record.get("record_id") or record.get("id") or f"{source_system}_row"),
+        "source_system": source_system,
+        "entity_type": entity_type,
+        "load_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    for column_name, value in record.items():
+        if column_name in {"source_system", "entity_type", "load_timestamp"}:
+            continue
+
+        classification = classify_column(column_name)
+        if classification == "UNKNOWN":
+            continue
+
+        standardized = standardize_value(value, classification)
+        if standardized is None:
+            continue
+
+        normalized[column_name] = standardized
+
+    return normalized
+
+
 def build_mdm_temp(df: DataFrame, source_system: str, entity_type: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for record in df.toPandas().to_dict(orient="records"):
-        record_id = str(record.get("record_id") or record.get("id") or f"{source_system}_{hash(str(record)) % 1000000}")
-        for column_name, value in record.items():
-            classification = classify_column(column_name)
-            if classification == "UNKNOWN":
-                continue
-            standardized = standardize_value(value, classification)
-            if standardized is None:
-                continue
-            rows.append(
-                {
-                    "record_id": record_id,
-                    "source_system": source_system,
-                    "entity_type": entity_type,
-                    "attribute_name": classification,
-                    "attribute_value": standardized,
-                    "load_timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-                }
-            )
+        normalized_row = normalize_record(record, source_system=source_system, entity_type=entity_type)
+        if normalized_row:
+            rows.append(normalized_row)
     return rows
 
 
@@ -205,6 +216,31 @@ def write_df(df: DataFrame, table_name: str) -> None:
     logger.info("Saved dataframe to %s", full_name)
 
 
+def write_deployment_watermark(
+    spark: SparkSession,
+    source_tables: List[str] | None = None,
+    priority_order: List[str] | None = None,
+) -> None:
+    """Persist the current deployment metadata so Databricks can prove the actual build in use."""
+    watermark_rows = [{
+        "deployment_version": "2026-09-02",
+        "build_name": "priority-one-row-per-source",
+        "catalog_name": CATALOG,
+        "schema_name": SCHEMA,
+        "priority_order": ",".join(priority_order or ["crm_customers", "banking_customers", "creditcard_customers"]),
+        "source_tables": ",".join(source_tables or [
+            "mdm.bronze.crm_customers",
+            "mdm.bronze.banking_customers",
+            "mdm.bronze.creditcard_customers",
+        ]),
+        "status": "updated",
+        "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+    }]
+    watermark_df = spark.createDataFrame(watermark_rows)
+    write_df(watermark_df, "deployment_watermark")
+    logger.info("Deployment watermark saved to %s.%s", CATALOG, "deployment_watermark")
+
+
 def process_all_tables() -> None:
     spark = get_spark()
     source_tables = [
@@ -257,6 +293,8 @@ def process_all_tables() -> None:
     } for key, value in golden_record["attributes"].items()]
     golden_df = spark.createDataFrame(rows_out)
     write_df(golden_df, "mdm_final")
+
+    write_deployment_watermark(spark, source_tables=source_tables, priority_order=priority_order)
 
     logger.info("MDM pipeline complete.")
 
