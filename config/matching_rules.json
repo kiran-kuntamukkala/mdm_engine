@@ -1,0 +1,7 @@
+{
+  "EMAIL": 50,
+  "PHONE": 40,
+  "NAME": 105,
+  "ADDRESS": 100,
+  "DEFAULT": 10
+}

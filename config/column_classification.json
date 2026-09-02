@@ -1,0 +1,9 @@
+{
+  "EMAIL": ["email", "mail", "email_id", "work_email", "e_mail"],
+  "PHONE": ["phone", "mobile", "mobile_no", "cell", "telephone"],
+  "NAME": ["name", "full_name", "cust_name", "customer_name", "person_name"],
+  "ADDRESS": ["address", "addr", "street_address", "mailing_address"],
+  "ID": ["id", "record_id", "customer_id", "account_id"],
+  "SOURCE_SYSTEM": ["source_system", "source", "system_name"],
+  "LOAD_TIMESTAMP": ["load_timestamp", "loaded_at", "ingest_ts"]
+}

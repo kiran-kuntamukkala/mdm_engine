@@ -1,0 +1,11 @@
+{
+  "DEFAULT_ENTITY": "UNKNOWN",
+  "ENTITY_RULES": [
+    {"entity": "CUSTOMER", "patterns": ["customer", "cust", "client"]},
+    {"entity": "PRODUCT", "patterns": ["product", "sku", "item"]},
+    {"entity": "VENDOR", "patterns": ["vendor", "supplier"]},
+    {"entity": "PATIENT", "patterns": ["patient", "member"]},
+    {"entity": "PROVIDER", "patterns": ["provider", "doctor", "physician"]},
+    {"entity": "EMPLOYEE", "patterns": ["employee", "staff", "personnel"]}
+  ]
+}
