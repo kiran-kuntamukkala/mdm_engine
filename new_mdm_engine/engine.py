@@ -83,18 +83,27 @@ def build_mdm_temp(spark: SparkSession, prioritized_tables: Sequence[str]) -> Da
 def _splink_pairs(mdm_temp: DataFrame, spark: SparkSession, threshold: float) -> DataFrame:
     """Use Splink to score candidate pairs; blocking keeps linkage scalable."""
     threshold = float(threshold)
+    import splink
+
+    splink_version = str(getattr(splink, "__version__", "unknown"))
+    if not splink_version.startswith("4."):
+        raise RuntimeError(
+            f"new_mdm_engine requires Splink 4.x, but Databricks loaded {splink_version}. "
+            "Install splink==4.0.17 and restart Python."
+        )
+
     from splink import Linker, SparkAPI, block_on
     from splink import comparison_library as cl
 
     settings = {
         "link_type": "dedupe_only",
         "unique_id_column_name": "source_row_id",
-        "probability_two_random_records_match": 0.01,
+        "probability_two_random_records_match": float(0.01),
         "comparisons": [
             cl.ExactMatch("email"),
             cl.ExactMatch("phone"),
-            cl.JaroWinklerAtThresholds("customer_name", [0.95, 0.85]),
-            cl.JaroWinklerAtThresholds("address", [0.95, 0.8]),
+            cl.JaroWinklerAtThresholds("customer_name", [float(0.95), float(0.85)]),
+            cl.JaroWinklerAtThresholds("address", [float(0.95), float(0.8)]),
         ],
         "blocking_rules_to_generate_predictions": [
             block_on("email"),
