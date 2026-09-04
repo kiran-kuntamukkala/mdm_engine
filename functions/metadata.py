@@ -36,7 +36,7 @@ def get_table_metadata(df: Any) -> List[Dict[str, str]]:
     DataFrames to keep the framework reusable across environments.
     """
     try:
-        if hasattr(df, "dtypes"):
+        if hasattr(df, "dtypes") and hasattr(df.dtypes, "items"):
             return [
                 {"column_name": column, "data_type": str(dtype)}
                 for column, dtype in df.dtypes.items()
