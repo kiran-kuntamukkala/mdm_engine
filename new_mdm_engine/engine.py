@@ -82,6 +82,7 @@ def build_mdm_temp(spark: SparkSession, prioritized_tables: Sequence[str]) -> Da
 
 def _splink_pairs(mdm_temp: DataFrame, spark: SparkSession, threshold: float) -> DataFrame:
     """Use Splink to score candidate pairs; blocking keeps linkage scalable."""
+    threshold = float(threshold)
     from splink import Linker, SparkAPI, block_on
     from splink import comparison_library as cl
 
@@ -150,6 +151,7 @@ def build_mdm(
     match_probability_threshold: float = 0.5,
 ) -> tuple[DataFrame, DataFrame]:
     """Build row-preserving ``mdm_temp`` and priority-resolved ``mdm_final``."""
+    match_probability_threshold = float(match_probability_threshold)
     mdm_temp = build_mdm_temp(spark, prioritized_tables)
     pairs = _splink_pairs(mdm_temp, spark, match_probability_threshold)
     clustered = _add_entity_ids(mdm_temp, pairs)

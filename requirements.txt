@@ -2,4 +2,4 @@ pyspark
 rapidfuzz
 pytest
 pandas
-splink
+splink==4.0.17
