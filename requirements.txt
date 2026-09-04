@@ -2,3 +2,4 @@ pyspark
 rapidfuzz
 pytest
 pandas
+splink
