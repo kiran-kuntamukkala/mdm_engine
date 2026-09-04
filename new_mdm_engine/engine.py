@@ -3,10 +3,11 @@ from __future__ import annotations
 from functools import reduce
 from typing import Sequence
 
-from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from functions.classifier import classify_column
+from functions.metadata import get_table_metadata, resolve_prioritized_metadata
 from functions.standardization import standardize_by_classification
 
 
@@ -55,16 +56,13 @@ def _canonicalize_table(df: DataFrame, source_table: str, priority: int) -> Data
             F.udf(lambda value, cls=classification: _value(value, cls), "string")(F.col(column)),
         )
 
-    row_window = Window.orderBy(F.monotonically_increasing_id())
     return (
         result.withColumn("source_table", F.lit(source_name))
         .withColumn("source_priority", F.lit(priority))
-        .withColumn("source_row_number", F.row_number().over(row_window))
         .withColumn(
             "source_row_id",
-            F.concat_ws(":", F.col("source_table"), F.col("source_row_number")),
+            F.concat_ws(":", F.col("source_table"), F.col("record_id")),
         )
-        .drop("source_row_number")
     )
 
 
@@ -173,34 +171,107 @@ def _add_entity_ids(mdm_temp: DataFrame, pairs: DataFrame) -> DataFrame:
 
 
 def _priority_value(df: DataFrame, column: str) -> F.Column:
-    return F.element_at(
-        F.sort_array(
-            F.collect_list(
-                F.when(
-                    F.col(column).isNotNull(),
-                    F.struct("source_priority", F.col(column)),
-                )
-            ),
-            asc=True,
-        ),
-        1,
-    )[column]
+    sorted_values = F.array_sort(
+        F.collect_list(
+            F.when(
+                F.col(column).isNotNull(),
+                F.struct("source_priority", F.col(column)),
+            )
+        )
+    )
+    return F.get(sorted_values, 0).getField(column)
+
+
+def _conflicting_values(df: DataFrame, column: str) -> F.Column:
+    """Keep every distinct source value when an entity has a disagreement."""
+    values = F.array_sort(
+        F.collect_set(
+            F.when(
+                F.col(column).isNotNull(),
+                F.struct("source_priority", "source_table", F.col(column).alias("value")),
+            )
+        )
+    )
+    return F.when(F.size(values) > 1, F.to_json(values)).otherwise(F.lit(None).cast("string"))
+
+
+def _priority_actions(
+    metadata: Sequence[dict[str, str]],
+    priority_order: Sequence[str],
+) -> list[dict[str, str]]:
+    """Describe why each master column name and type was selected."""
+    return [
+        {
+            "decision_type": "COLUMN_SCHEMA",
+            "logical_field": classify_column(item["column_name"]),
+            "master_column": item["column_name"],
+            "data_type": item["data_type"],
+            "selected_source": item["source_name"],
+            "priority_order": ",".join(priority_order),
+            "reason": "Selected from the highest-priority source containing this logical field.",
+        }
+        for item in metadata
+    ]
 
 
 def build_mdm(
     spark: SparkSession,
     prioritized_tables: Sequence[str],
     match_probability_threshold: float = 0.5,
+    actions_table: str | None = None,
 ) -> tuple[DataFrame, DataFrame]:
-    """Build row-preserving ``mdm_temp`` and priority-resolved ``mdm_final``."""
+    """Build row-preserving temp data and a priority-resolved master table.
+
+    ``actions_table`` optionally persists the schema decisions separately from the
+    master data so every selected name and type has an auditable explanation.
+    """
     match_probability_threshold = float(match_probability_threshold)
     mdm_temp = build_mdm_temp(spark, prioritized_tables)
+    source_names = [_source_name(table_name) for table_name in prioritized_tables]
+    metadata_by_source = {
+        source_name: get_table_metadata(spark.table(table_name))
+        for source_name, table_name in zip(source_names, prioritized_tables)
+    }
+    prioritized_metadata = resolve_prioritized_metadata(metadata_by_source, source_names)
+    metadata_by_field = {
+        classify_column(item["column_name"]): item for item in prioritized_metadata
+    }
     pairs = _splink_pairs(mdm_temp, spark, match_probability_threshold)
     clustered = _add_entity_ids(mdm_temp, pairs)
+    selected_internal = [
+        _priority_value(clustered, column).alias(f"_selected_{column}")
+        for column in MATCH_COLUMNS
+    ]
+    conflict_internal = [
+        _conflicting_values(clustered, column).alias(f"_conflicts_{column.lower()}")
+        for column in MATCH_COLUMNS
+    ]
     final = clustered.groupBy("component_id").agg(
-        *[_priority_value(clustered, column).alias(column) for column in MATCH_COLUMNS],
-        _priority_value(clustered, "record_id").alias("record_id"),
+        *selected_internal,
+        *conflict_internal,
+        _priority_value(clustered, "record_id").alias("_selected_record_id"),
         F.sort_array(F.collect_list(F.col("source_payload"))).alias("source_records"),
         F.count("source_row_id").alias("source_record_count"),
     ).withColumnRenamed("component_id", "entity_id")
+
+    output_columns = []
+    for internal_name in (*MATCH_COLUMNS, "record_id"):
+        category = "ID" if internal_name == "record_id" else classify_column(internal_name)
+        metadata = metadata_by_field.get(category)
+        output_name = metadata["column_name"] if metadata else internal_name
+        data_type = metadata["data_type"] if metadata else "string"
+        output_columns.append(F.col(f"_selected_{internal_name}").cast(data_type).alias(output_name))
+
+    final = final.select(
+        "entity_id",
+        *output_columns,
+        *[f"_conflicts_{column.lower()}" for column in MATCH_COLUMNS],
+        "source_records",
+        "source_record_count",
+    )
+
+    if actions_table:
+        actions = spark.createDataFrame(_priority_actions(prioritized_metadata, source_names))
+        actions.write.mode("overwrite").saveAsTable(actions_table)
+
     return mdm_temp, final
