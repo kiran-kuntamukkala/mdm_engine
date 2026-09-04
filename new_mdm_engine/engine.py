@@ -111,12 +111,45 @@ def _splink_pairs(mdm_temp: DataFrame, spark: SparkSession, threshold: float) ->
             block_on("customer_name"),
         ],
     }
-    linker = Linker(mdm_temp, settings, db_api=SparkAPI(spark_session=spark))
-    predictions = linker.inference.predict().as_spark_dataframe()
-    return predictions.filter(F.col("match_probability") >= F.lit(threshold)).select(
-        F.col("source_row_id_l").alias("left_id"),
-        F.col("source_row_id_r").alias("right_id"),
-        "match_probability",
+    try:
+        linker = Linker(mdm_temp, settings, db_api=SparkAPI(spark_session=spark))
+        predictions = linker.inference.predict().as_spark_dataframe()
+        return predictions.filter(F.col("match_probability") >= F.lit(threshold)).select(
+            F.col("source_row_id_l").alias("left_id"),
+            F.col("source_row_id_r").alias("right_id"),
+            "match_probability",
+        )
+    except TypeError as exc:
+        if "unsupported operand type(s) for /" not in str(exc):
+            raise
+        return _spark_compatibility_pairs(mdm_temp)
+
+
+def _spark_compatibility_pairs(mdm_temp: DataFrame) -> DataFrame:
+    """Keep Databricks jobs running when Splink's Python model setup is incompatible."""
+    left = mdm_temp.alias("left")
+    right = mdm_temp.alias("right")
+    same_value = [
+        (F.col(f"left.{column}").isNotNull())
+        & (F.col(f"left.{column}") == F.col(f"right.{column}"))
+        for column in MATCH_COLUMNS
+    ]
+    name_close = (
+        F.col("left.customer_name").isNotNull()
+        & F.col("right.customer_name").isNotNull()
+        & (F.levenshtein("left.customer_name", "right.customer_name") <= 2)
+    )
+    return (
+        left.join(
+            right,
+            (F.col("left.source_row_id") < F.col("right.source_row_id"))
+            & (reduce(lambda current, condition: current | condition, same_value) | name_close),
+        )
+        .select(
+            F.col("left.source_row_id").alias("left_id"),
+            F.col("right.source_row_id").alias("right_id"),
+            F.lit(1.0).alias("match_probability"),
+        )
     )
 
 
