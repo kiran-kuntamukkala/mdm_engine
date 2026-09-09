@@ -20,10 +20,12 @@ def main() -> None:
     spark = build_spark_session()
 
     try:
+        catalog = str(spark.catalog.currentCatalog()).strip() if hasattr(spark, "catalog") else "main"
+        schema = "bronze"
         source_tables = [
-            "mdm.bronze.crm_customers",
-            "mdm.bronze.banking_customers",
-            "mdm.bronze.creditcard_customers",
+            f"{catalog}.{schema}.crm_customers",
+            f"{catalog}.{schema}.banking_customers",
+            f"{catalog}.{schema}.creditcard_customers",
         ]
         priority_order = ["crm_customers", "banking_customers", "creditcard_customers"]
         metadata_by_source = {}

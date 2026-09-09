@@ -15,8 +15,10 @@ from functions.metadata import pick_prioritized_value, resolve_prioritized_metad
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("databricks_mdm")
 
-CATALOG = "mdm"
-SCHEMA = "bronze"
+DEFAULT_CATALOG = "mdm"
+DEFAULT_SCHEMA = "bronze"
+CATALOG = DEFAULT_CATALOG
+SCHEMA = DEFAULT_SCHEMA
 
 
 def get_spark() -> SparkSession:
@@ -25,6 +27,22 @@ def get_spark() -> SparkSession:
         return SparkSession.getActiveSession()
     except Exception:
         return SparkSession.builder.appName("mdm_databricks_demo").getOrCreate()
+
+
+def resolve_catalog_and_schema(spark: SparkSession | None = None) -> tuple[str, str]:
+    """Return the effective catalog and schema, defaulting to the active catalog when UC creation is not allowed."""
+    spark = spark or get_spark()
+    catalog = DEFAULT_CATALOG
+    try:
+        current_catalog = str(spark.catalog.currentCatalog()).strip()
+        if current_catalog:
+            catalog = current_catalog
+    except Exception:
+        pass
+    global CATALOG, SCHEMA
+    CATALOG = catalog
+    SCHEMA = DEFAULT_SCHEMA
+    return CATALOG, SCHEMA
 
 
 def load_json(path: str) -> Dict[str, Any]:
@@ -211,7 +229,8 @@ def create_golden_record(matched_records: Iterable[Dict[str, Any]], entity_type:
 
 
 def write_df(df: DataFrame, table_name: str) -> None:
-    full_name = f"{CATALOG}.{SCHEMA}.{table_name}"
+    catalog, schema = resolve_catalog_and_schema()
+    full_name = f"{catalog}.{schema}.{table_name}"
     df.write.mode("overwrite").saveAsTable(full_name)
     logger.info("Saved dataframe to %s", full_name)
 
@@ -222,31 +241,33 @@ def write_deployment_watermark(
     priority_order: List[str] | None = None,
 ) -> None:
     """Persist the current deployment metadata so Databricks can prove the actual build in use."""
+    catalog, schema = resolve_catalog_and_schema(spark)
     watermark_rows = [{
         "deployment_version": "2026-09-02",
         "build_name": "priority-one-row-per-source",
-        "catalog_name": CATALOG,
-        "schema_name": SCHEMA,
+        "catalog_name": catalog,
+        "schema_name": schema,
         "priority_order": ",".join(priority_order or ["crm_customers", "banking_customers", "creditcard_customers"]),
         "source_tables": ",".join(source_tables or [
-            "mdm.bronze.crm_customers",
-            "mdm.bronze.banking_customers",
-            "mdm.bronze.creditcard_customers",
+            f"{catalog}.{schema}.crm_customers",
+            f"{catalog}.{schema}.banking_customers",
+            f"{catalog}.{schema}.creditcard_customers",
         ]),
         "status": "updated",
         "updated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
     }]
     watermark_df = spark.createDataFrame(watermark_rows)
     write_df(watermark_df, "deployment_watermark")
-    logger.info("Deployment watermark saved to %s.%s", CATALOG, "deployment_watermark")
+    logger.info("Deployment watermark saved to %s.%s", catalog, "deployment_watermark")
 
 
 def process_all_tables() -> None:
     spark = get_spark()
+    catalog, schema = resolve_catalog_and_schema(spark)
     source_tables = [
-        "mdm.bronze.crm_customers",
-        "mdm.bronze.banking_customers",
-        "mdm.bronze.creditcard_customers",
+        f"{catalog}.{schema}.crm_customers",
+        f"{catalog}.{schema}.banking_customers",
+        f"{catalog}.{schema}.creditcard_customers",
     ]
     priority_order = ["crm_customers", "banking_customers", "creditcard_customers"]
     metadata_by_source: Dict[str, List[Dict[str, str]]] = {}

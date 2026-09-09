@@ -1,5 +1,8 @@
-pyspark
+pyspark==3.5.2
 rapidfuzz
 pytest
 pandas
 splink==4.0.17
+streamlit
+databricks-connect==16.1.7
+databricks-sql-connector==4.5.0

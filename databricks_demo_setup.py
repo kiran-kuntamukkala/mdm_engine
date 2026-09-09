@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Tuple
 
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType
@@ -13,10 +13,53 @@ def build_spark() -> SparkSession:
     return SparkSession.getActiveSession()
 
 
+def get_effective_catalog(spark: SparkSession, default_catalog: str = "mdm") -> str:
+    """Return the current or fallback catalog that the caller is allowed to use."""
+    try:
+        current = str(spark.catalog.currentCatalog()).strip()
+        if current:
+            return current
+    except Exception:
+        pass
+    return default_catalog
+
+
+def _is_permission_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "INSUFFICIENT_PERMISSIONS" in message
+        or "CREATE on CATALOG" in message
+        or "CREATE on SCHEMA" in message
+        or "permission" in message.lower()
+    )
+
+
+def ensure_catalog_and_schema(spark: SparkSession, catalog: str = "mdm", schema: str = "bronze") -> Tuple[str, str]:
+    """Create the catalog/schema only when permitted; otherwise use the current accessible catalog."""
+    try:
+        spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
+    except Exception as exc:  # pragma: no cover - Databricks permission behavior is environment-specific
+        if not _is_permission_error(exc):
+            raise
+        fallback_catalog = get_effective_catalog(spark, default_catalog="main")
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {fallback_catalog}.{schema}")
+        return fallback_catalog, schema
+
+    try:
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+    except Exception as exc:  # pragma: no cover - Databricks permission behavior is environment-specific
+        if not _is_permission_error(exc):
+            raise
+        fallback_catalog = get_effective_catalog(spark, default_catalog="main")
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {fallback_catalog}.{schema}")
+        return fallback_catalog, schema
+
+    return catalog, schema
+
+
 def create_catalog_and_schema(spark: SparkSession) -> None:
-    """Create the Unity Catalog catalog and Bronze schema if they do not already exist."""
-    spark.sql("CREATE CATALOG IF NOT EXISTS mdm")
-    spark.sql("CREATE SCHEMA IF NOT EXISTS mdm.bronze")
+    """Backward-compatible wrapper for the legacy setup helper."""
+    ensure_catalog_and_schema(spark)
 
 
 def crm_customers_rows() -> List[dict]:
@@ -99,6 +142,9 @@ def creditcard_customers_rows() -> List[dict]:
 
 def create_demo_tables(spark: SparkSession) -> None:
     """Create the demo source tables with realistic variation and duplicates."""
+    catalog, schema = ensure_catalog_and_schema(spark)
+    table_prefix = f"{catalog}.{schema}"
+
     crm_schema = StructType([
         StructField("record_id", StringType(), True),
         StructField("customer_name", StringType(), True),
@@ -123,16 +169,17 @@ def create_demo_tables(spark: SparkSession) -> None:
         StructField("street_address", StringType(), True),
     ])
 
-    spark.createDataFrame(crm_customers_rows(), schema=crm_schema).write.mode("overwrite").saveAsTable("mdm.bronze.crm_customers")
-    spark.createDataFrame(banking_customers_rows(), schema=banking_schema).write.mode("overwrite").saveAsTable("mdm.bronze.banking_customers")
-    spark.createDataFrame(creditcard_customers_rows(), schema=credit_schema).write.mode("overwrite").saveAsTable("mdm.bronze.creditcard_customers")
+    spark.createDataFrame(crm_customers_rows(), schema=crm_schema).write.mode("overwrite").saveAsTable(f"{table_prefix}.crm_customers")
+    spark.createDataFrame(banking_customers_rows(), schema=banking_schema).write.mode("overwrite").saveAsTable(f"{table_prefix}.banking_customers")
+    spark.createDataFrame(creditcard_customers_rows(), schema=credit_schema).write.mode("overwrite").saveAsTable(f"{table_prefix}.creditcard_customers")
 
-    print("Created and loaded demo data into bronze source tables.")
+    print(f"Created and loaded demo data into {table_prefix} source tables.")
 
 
 def main() -> None:
     spark = build_spark()
-    create_catalog_and_schema(spark)
+    catalog, schema = ensure_catalog_and_schema(spark)
+    print(f"Using catalog/schema {catalog}.{schema} for demo MDM tables.")
     create_demo_tables(spark)
     process_all_tables()
     print("Demo MDM pipeline completed successfully.")

@@ -61,3 +61,16 @@ def test_build_mdm_temp_returns_one_canonical_row_per_source_record():
     assert canonical_rows[0]["mobile_no"] == "9876543210"
     assert "attribute_name" not in canonical_rows[0]
     assert "attribute_value" not in canonical_rows[0]
+
+
+def test_build_mdm_temp_merges_first_name_aliases_into_customer_name():
+    rows = [
+        {"record_id": "CRM001", "first_name": "Robert"},
+        {"record_id": "BANK001", "fname": "Alice"},
+        {"record_id": "CARD001", "fnm": "Maria"},
+    ]
+
+    canonical_rows = build_mdm_temp(rows, source_system="mixed_sources", entity_type="CUSTOMER")
+
+    assert [row["customer_name"] for row in canonical_rows] == ["ROBERT", "ALICE", "MARIA"]
+    assert all("first_name" not in row and "fname" not in row and "fnm" not in row for row in canonical_rows)

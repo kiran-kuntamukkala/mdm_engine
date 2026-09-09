@@ -30,10 +30,3 @@ def load_json_config(filename: str):
 
     with open(config_path, "r", encoding="utf-8") as file_handle:
         return json.load(file_handle)
-
-
-def safe_string(value):
-    """Convert a value to a meaningful string while handling nulls."""
-    if value is None:
-        return ""
-    return str(value).strip()

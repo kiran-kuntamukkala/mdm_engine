@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import reduce
 from typing import Sequence
+from uuid import uuid4
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -88,12 +89,23 @@ def build_mdm_temp(spark: SparkSession, prioritized_tables: Sequence[str]) -> Da
         _canonicalize_table(spark.table(table_name), table_name, priority)
         for priority, table_name in enumerate(prioritized_tables, start=1)
     ]
-    return reduce(DataFrame.unionByName, tables)
+    view_names = [f"mdm_source_{uuid4().hex}" for _ in tables]
+    for view_name, table in zip(view_names, tables):
+        table.createOrReplaceTempView(view_name)
+    return spark.sql(" UNION ALL ".join(f"SELECT * FROM `{name}`" for name in view_names))
 
 
-def _splink_pairs(mdm_temp: DataFrame, spark: SparkSession, threshold: float) -> DataFrame:
+def _splink_pairs(
+    mdm_temp: DataFrame,
+    spark: SparkSession,
+    threshold: float,
+    match_columns: Sequence[str],
+) -> DataFrame:
     """Use Splink to score candidate pairs; blocking keeps linkage scalable."""
     threshold = float(threshold)
+    if type(mdm_temp).__module__.startswith("pyspark.sql.connect"):
+        return _spark_compatibility_pairs(mdm_temp, match_columns)
+
     import splink
 
     splink_version = str(getattr(splink, "__version__", "unknown"))
@@ -111,16 +123,14 @@ def _splink_pairs(mdm_temp: DataFrame, spark: SparkSession, threshold: float) ->
         "unique_id_column_name": "source_row_id",
         "probability_two_random_records_match": float(0.01),
         "comparisons": [
-            cl.ExactMatch("email"),
-            cl.ExactMatch("phone"),
-            cl.JaroWinklerAtThresholds("customer_name", [float(0.95), float(0.85)]),
-            cl.JaroWinklerAtThresholds("address", [float(0.95), float(0.8)]),
+            cl.ExactMatch(column) if column in {"email", "phone"} else
+            cl.JaroWinklerAtThresholds(
+                column,
+                [float(0.95), float(0.85)] if column == "customer_name" else [float(0.95), float(0.8)],
+            )
+            for column in match_columns
         ],
-        "blocking_rules_to_generate_predictions": [
-            block_on("email"),
-            block_on("phone"),
-            block_on("customer_name"),
-        ],
+        "blocking_rules_to_generate_predictions": [block_on(column) for column in match_columns],
     }
     try:
         linker = Linker(mdm_temp, settings, db_api=SparkAPI(spark_session=spark))
@@ -133,23 +143,24 @@ def _splink_pairs(mdm_temp: DataFrame, spark: SparkSession, threshold: float) ->
     except TypeError as exc:
         if "unsupported operand type(s) for /" not in str(exc):
             raise
-        return _spark_compatibility_pairs(mdm_temp)
+        return _spark_compatibility_pairs(mdm_temp, match_columns)
 
-
-def _spark_compatibility_pairs(mdm_temp: DataFrame) -> DataFrame:
+def _spark_compatibility_pairs(mdm_temp: DataFrame, match_columns: Sequence[str]) -> DataFrame:
     """Keep Databricks jobs running when Splink's Python model setup is incompatible."""
     left = mdm_temp.alias("left")
     right = mdm_temp.alias("right")
     same_value = [
         (F.col(f"left.{column}").isNotNull())
         & (F.col(f"left.{column}") == F.col(f"right.{column}"))
-        for column in MATCH_COLUMNS
+        for column in match_columns
     ]
-    name_close = (
-        F.col("left.customer_name").isNotNull()
-        & F.col("right.customer_name").isNotNull()
-        & (F.levenshtein("left.customer_name", "right.customer_name") <= 2)
-    )
+    name_close = F.lit(False)
+    if "customer_name" in match_columns:
+        name_close = (
+            F.col("left.customer_name").isNotNull()
+            & F.col("right.customer_name").isNotNull()
+            & (F.levenshtein("left.customer_name", "right.customer_name") <= 2)
+        )
     return (
         left.join(
             right,
@@ -171,14 +182,29 @@ def _add_entity_ids(mdm_temp: DataFrame, pairs: DataFrame) -> DataFrame:
     components = nodes.withColumn("component_id", F.col("node_id"))
     changed = True
     while changed:
-        propagated = (
+        updates = (
             edges.join(components.alias("left"), F.col("left_id") == F.col("left.node_id"))
             .select(F.col("right_id").alias("node_id"), F.col("left.component_id"))
-            .unionByName(components.select("node_id", "component_id"))
             .groupBy("node_id")
             .agg(F.min("component_id").alias("component_id"))
         )
-        changed = components.exceptAll(propagated).limit(1).count() > 0
+        propagated = (
+            components.alias("existing")
+            .join(updates.alias("updates"), "node_id", "left")
+            .select(
+                F.col("node_id"),
+                F.least(
+                    F.col("existing.component_id"),
+                    F.coalesce(F.col("updates.component_id"), F.col("existing.component_id")),
+                ).alias("component_id"),
+            )
+        )
+        changed = (
+            components.join(propagated, ["node_id", "component_id"], "leftanti")
+            .limit(1)
+            .count()
+            > 0
+        )
         components = propagated
     return mdm_temp.join(components, mdm_temp.source_row_id == components.node_id).drop("node_id")
 
@@ -232,6 +258,7 @@ def build_mdm(
     prioritized_tables: Sequence[str],
     match_probability_threshold: float = 0.5,
     actions_table: str | None = None,
+    match_columns: Sequence[str] | None = None,
 ) -> tuple[DataFrame, DataFrame]:
     """Build row-preserving temp data and a priority-resolved master table.
 
@@ -239,6 +266,15 @@ def build_mdm(
     master data so every selected name and type has an auditable explanation.
     """
     match_probability_threshold = float(match_probability_threshold)
+    selected_match_columns = tuple(match_columns or MATCH_COLUMNS)
+    invalid_columns = set(selected_match_columns) - set(MATCH_COLUMNS)
+    if invalid_columns:
+        raise ValueError(
+            "match_columns must use canonical fields: "
+            f"{', '.join(sorted(set(MATCH_COLUMNS)))}; invalid: {', '.join(sorted(invalid_columns))}"
+        )
+    if not selected_match_columns:
+        raise ValueError("match_columns must contain at least one field")
     mdm_temp = build_mdm_temp(spark, prioritized_tables)
     source_names = [_source_name(table_name) for table_name in prioritized_tables]
     metadata_by_source = {
@@ -249,15 +285,17 @@ def build_mdm(
     metadata_by_field = {
         classify_column(item["column_name"]): item for item in prioritized_metadata
     }
-    pairs = _splink_pairs(mdm_temp, spark, match_probability_threshold)
+    pairs = _splink_pairs(mdm_temp, spark, match_probability_threshold, selected_match_columns)
     clustered = _add_entity_ids(mdm_temp, pairs)
     selected_internal = [
         _priority_value(clustered, column).alias(f"_selected_{column}")
         for column in MATCH_COLUMNS
+        if column in selected_match_columns
     ]
     conflict_internal = [
         _conflicting_values(clustered, column).alias(f"_conflicts_{column.lower()}")
         for column in MATCH_COLUMNS
+        if column in selected_match_columns
     ]
     final = clustered.groupBy("component_id").agg(
         *selected_internal,
@@ -268,17 +306,18 @@ def build_mdm(
     ).withColumnRenamed("component_id", "entity_id")
 
     output_columns = []
-    for internal_name in (*MATCH_COLUMNS, "record_id"):
+    for internal_name in (*selected_match_columns, "record_id"):
         category = "ID" if internal_name == "record_id" else classify_column(internal_name)
         metadata = metadata_by_field.get(category)
-        output_name = metadata["column_name"] if metadata else internal_name
         data_type = metadata["data_type"] if metadata else "string"
-        output_columns.append(F.col(f"_selected_{internal_name}").cast(data_type).alias(output_name))
+        output_columns.append(
+            F.col(f"_selected_{internal_name}").cast(data_type).alias(internal_name)
+        )
 
     final = final.select(
         "entity_id",
         *output_columns,
-        *[f"_conflicts_{column.lower()}" for column in MATCH_COLUMNS],
+        *[f"_conflicts_{column.lower()}" for column in selected_match_columns],
         "source_records",
         "source_record_count",
     )

@@ -9,6 +9,23 @@ from functions.utils import get_logger
 
 logger = get_logger(__name__)
 
+CANONICAL_COLUMN_NAMES = {
+    "EMAIL": "email_id",
+    "PHONE": "mobile_no",
+    "NAME": "customer_name",
+    "ADDRESS": "address",
+    "ID": "record_id",
+}
+
+
+def _canonical_column_name(column_name: str, classification: str) -> str:
+    """Return one stable output column for all aliases of a classified field."""
+    canonical_name = CANONICAL_COLUMN_NAMES.get(classification)
+    if canonical_name:
+        return canonical_name
+
+    return column_name
+
 
 def normalize_record(record: Dict[str, Any], source_system: str, entity_type: str) -> Dict[str, Any]:
     """Convert a source record into a single canonical MDM temp row."""
@@ -32,7 +49,11 @@ def normalize_record(record: Dict[str, Any], source_system: str, entity_type: st
             if standardized_value is None:
                 continue
 
-            normalized[column_name] = standardized_value
+            canonical_name = _canonical_column_name(column_name, classification)
+            if canonical_name == "record_id" and normalized.get("record_id"):
+                continue
+
+            normalized[canonical_name] = standardized_value
 
         return normalized
     except Exception as exc:  # pragma: no cover - defensive logging
