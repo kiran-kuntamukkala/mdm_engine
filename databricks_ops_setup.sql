@@ -33,6 +33,4 @@ CREATE TABLE IF NOT EXISTS mdm.ops.mdm_run_actions (
 -- GRANT USE SCHEMA ON SCHEMA mdm.ops TO `mdm_app_users`;
 -- GRANT MODIFY ON TABLE mdm.ops.mdm_run_summary TO `mdm_app_users`;
 -- GRANT MODIFY ON TABLE mdm.ops.mdm_run_actions TO `mdm_app_users`;
-https://adb-1109595526709077.17.azuredatabricks.net/
 
--- dapiea7deda690abbfef7ddeb7adcfe1564d-3
