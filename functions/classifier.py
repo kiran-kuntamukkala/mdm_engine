@@ -12,8 +12,11 @@ def _normalize_token(value: Any) -> str:
     """Normalize a column name so string comparisons are stable and pattern-based."""
     if value is None:
         return ""
-    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = str(value).strip()
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+    normalized = normalized.lower().replace("-", "_").replace(" ", "_")
     normalized = re.sub(r"[^a-z0-9_]+", "", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
     return normalized
 
 def _token_variants(value: Any) -> set[str]:

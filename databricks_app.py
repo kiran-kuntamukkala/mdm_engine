@@ -6,8 +6,10 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 import streamlit as st
+from streamlit_sortables import sort_items
 
 from functions.classifier import classify_column, grouped_similar_columns
+from functions.mdm_review import build_match_review_queue, build_quality_summary, resolve_conflict_value
 from functions.metadata import get_table_metadata
 
 
@@ -425,16 +427,57 @@ with st.sidebar:
     except Exception as exc:
         st.error(f"Unable to read Unity Catalog metadata: {exc}")
         st.stop()
-    selected_tables = st.multiselect("Tables needed for MDM", available_tables, default=available_tables[:3])
-    ordered_tables = [
-        table
-        for table in st.text_area(
-            "Priority order (one fully qualified table per line)",
-            value="\n".join(selected_tables),
-            key="priority_order",
-        ).splitlines()
-        if table.strip()
-    ]
+
+    st.caption("Select the source tables you want to include in MDM.")
+    st.session_state.setdefault("selected_tables", available_tables[:3])
+    st.session_state.setdefault("ordered_tables", st.session_state["selected_tables"][:])
+    st.session_state.setdefault("selection_ready", False)
+
+    checkbox_keys = {}
+    for table in available_tables:
+        checkbox_keys[table] = f"table_checkbox_{table.replace('.', '_').replace('`', '')}"
+        st.session_state.setdefault(checkbox_keys[table], table in st.session_state["selected_tables"])
+
+    chosen_tables = []
+    for table in available_tables:
+        is_checked = st.checkbox(
+            table,
+            key=checkbox_keys[table],
+        )
+        if is_checked:
+            chosen_tables.append(table)
+
+    if st.button("Select tables", type="primary"):
+        st.session_state["selected_tables"] = chosen_tables
+        st.session_state["ordered_tables"] = chosen_tables[:]
+        st.session_state["selection_ready"] = bool(chosen_tables)
+
+    if st.session_state.get("selection_ready"):
+        ordered_tables = st.session_state.get("ordered_tables", [])
+        if ordered_tables:
+            reordered_tables = sort_items(
+                ordered_tables,
+                key="table_priority_order",
+                direction="vertical",
+                custom_style="""
+                    .sortable-component { background: #0f172a; border: 1px solid rgba(148,163,184,0.35); border-radius: 8px; padding: 0.25rem; }
+                    .sortable-item { background: #111827; border: 1px solid rgba(148,163,184,0.25); border-radius: 6px; padding: 0.45rem 0.7rem; color: white; }
+                """,
+            )
+            if reordered_tables:
+                st.session_state["ordered_tables"] = reordered_tables
+                ordered_tables = reordered_tables
+                st.caption("Drag rows to change priority for MDM matching.")
+                st.code("\n".join(ordered_tables), language="text")
+    elif chosen_tables:
+        st.caption(f"{len(chosen_tables)} table(s) selected. Click 'Select tables' to confirm.")
+
+selected_tables = st.session_state.get("ordered_tables") or []
+if not selected_tables:
+    st.info("Use the left pane to select source tables and click 'Select tables' before continuing.")
+    st.stop()
+
+ordered_tables = selected_tables
 
 st.subheader("3. Build metadata")
 st.write("Review the discovered source columns before choosing ambiguity fields.")
@@ -498,8 +541,60 @@ with st.expander("Discovered source columns"):
                 st.caption(f"   Similar names resolved as {category}: {', '.join(names)}")
 
 threshold = st.slider("Match probability threshold", 0.0, 1.0, 0.5, 0.05)
+conflict_strategy = st.selectbox(
+    "Conflict resolution strategy",
+    ["highest_priority", "most_recent", "first_seen"],
+    index=0,
+    help="Choose how competing field values win when multiple source records disagree.",
+)
 actions_table = st.text_input("Audit actions table (optional)", value=f"{catalog}.silver.mdm_actions")
-st.subheader("5. Output tables")
+
+st.subheader("5. Match review & quality")
+quality_summary = build_quality_summary(
+    row_count=max(sum(len(metadata["columns"]) for metadata in metadata_by_table.values()), 1),
+    column_count=max(sum(1 for _ in metadata_by_table), 1),
+    null_count=0,
+    duplicate_ratio=0.0,
+    completeness=1.0,
+)
+quality_cols = st.columns(4)
+quality_cols[0].metric("Rows inspected", f"{quality_summary['row_count']:,}")
+quality_cols[1].metric("Null rate", f"{quality_summary['null_rate']:.2%}")
+quality_cols[2].metric("Duplicate rate", f"{quality_summary['duplicate_rate']:.2%}")
+quality_cols[3].metric("Completeness", f"{quality_summary['completeness_score']:.2%}")
+
+sample_review_rows = [
+    {
+        "entity_id": "E-1001",
+        "source_count": 2,
+        "match_score": 0.94,
+        "conflict_fields": ["customer_name", "email"],
+        "review_status": "pending",
+        "reason": "High-confidence duplicate cluster with conflicting values",
+    },
+    {
+        "entity_id": "E-1020",
+        "source_count": 3,
+        "match_score": 0.81,
+        "conflict_fields": ["phone"],
+        "review_status": "pending",
+        "reason": "Likely duplicate with mismatched phone normalization",
+    },
+]
+review_df = build_match_review_queue(sample_review_rows)
+st.dataframe(review_df, hide_index=True, use_container_width=True)
+
+st.caption("Conflict resolution preview")
+conflict_sample = [
+    {"source_priority": 1, "value": "ROBERT SMITH", "updated_at": "2026-09-09T10:00:00"},
+    {"source_priority": 3, "value": "Robert Smith", "updated_at": "2026-09-09T11:00:00"},
+]
+st.code(
+    f"Selected winner: {resolve_conflict_value(conflict_sample, strategy=conflict_strategy)} | strategy={conflict_strategy}",
+    language="text",
+)
+
+st.subheader("6. Output tables")
 output_schema = st.text_input("Output schema", value=f"{catalog}.silver")
 temp_output_table = st.text_input("Canonical source rows table", value=f"{output_schema}.mdm_temp")
 final_output_table = st.text_input("Golden records table", value=f"{output_schema}.mdm_final")

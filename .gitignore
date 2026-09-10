@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 .pytest_cache/
 .venv/
+.venv312/
 venv/
 .env
 .DS_Store
