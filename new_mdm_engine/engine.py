@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import reduce
 from typing import Sequence
 from uuid import uuid4
@@ -16,9 +17,38 @@ CANONICAL_COLUMNS = {
     "EMAIL": "email",
     "PHONE": "phone",
     "ADDRESS": "address",
-    "ID": "record_id",
 }
 MATCH_COLUMNS = ("email", "phone", "customer_name", "address")
+
+
+def _canonical_output_name(column_name: str, classification: str | None = None) -> str:
+    """Normalize source attributes to a stable logical field name for the master table."""
+    raw_name = str(column_name or "").strip()
+    normalized = raw_name.lower().replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+    normalized = re.sub(r"[^a-z0-9_]+", "", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    category = (classification or classify_column(column_name) or "UNKNOWN").upper()
+
+    if category == "NAME":
+        return "customer_name"
+    if category == "EMAIL":
+        return "email"
+    if category == "PHONE":
+        return "phone"
+    if category == "ADDRESS":
+        return "address"
+    if category == "ID":
+        if "account" in normalized:
+            return "account_id"
+        if "customer" in normalized:
+            return "customer_id"
+        if "record" in normalized or normalized in {"id", "recordid"}:
+            return "record_id"
+        return normalized or "record_id"
+    if normalized:
+        return normalized
+    return "record_id"
 
 
 def _source_name(table_name: str) -> str:
@@ -49,33 +79,51 @@ def _standardize_expression(column: F.Column, classification: str) -> F.Column:
     return non_empty
 
 
-def _canonicalize_table(df: DataFrame, source_table: str, priority: int) -> DataFrame:
+def _logical_fields_for_table(df: DataFrame) -> list[str]:
+    """Return the ordered logical field names for a source table, including ID columns."""
+    fields: list[str] = []
+    for column in df.columns:
+        classification = classify_column(column)
+        logical_name = _canonical_output_name(column, classification)
+        if logical_name not in fields:
+            fields.append(logical_name)
+    return fields
+
+
+def _canonicalize_table(df: DataFrame, source_table: str, priority: int, output_fields: Sequence[str]) -> DataFrame:
     source_name = _source_name(source_table)
     classified = {column: classify_column(column) for column in df.columns}
     payload_columns = [F.col(column).cast("string").alias(column) for column in df.columns]
 
     canonical = []
-    for category, canonical_name in CANONICAL_COLUMNS.items():
-        candidates = [column for column, value in classified.items() if value == category]
+    for logical_name in output_fields:
+        candidates = [
+            column for column, value in classified.items()
+            if _canonical_output_name(column, value) == logical_name
+        ]
         if candidates:
             expressions = [F.col(column).cast("string") for column in candidates]
-            canonical.append(F.coalesce(*expressions).alias(canonical_name))
+            canonical.append(F.coalesce(*expressions).alias(logical_name))
         else:
-            canonical.append(F.lit(None).cast("string").alias(canonical_name))
+            canonical.append(F.lit(None).cast("string").alias(logical_name))
 
     result = df.select(
         *canonical,
         F.to_json(F.struct(*payload_columns)).alias("source_payload"),
     )
-    for column, classification in ((name, category) for category, name in CANONICAL_COLUMNS.items()):
-        result = result.withColumn(column, _standardize_expression(F.col(column), classification))
+    for logical_name in output_fields:
+        if logical_name in CANONICAL_COLUMNS.values():
+            classification = next(
+                key for key, value in CANONICAL_COLUMNS.items() if value == logical_name
+            )
+            result = result.withColumn(logical_name, _standardize_expression(F.col(logical_name), classification))
 
     return (
         result.withColumn("source_table", F.lit(source_name))
         .withColumn("source_priority", F.lit(priority))
         .withColumn(
             "source_row_id",
-            F.concat_ws(":", F.col("source_table"), F.col("record_id")),
+            F.concat_ws(":", F.col("source_table"), F.coalesce(F.col("record_id"), F.col("customer_id"), F.col("account_id"), F.lit("unknown"))),
         )
     )
 
@@ -85,9 +133,16 @@ def build_mdm_temp(spark: SparkSession, prioritized_tables: Sequence[str]) -> Da
     if not prioritized_tables:
         raise ValueError("prioritized_tables must contain at least one table")
 
+    source_frames = [spark.table(table_name) for table_name in prioritized_tables]
+    output_fields = []
+    for dataframe in source_frames:
+        for logical_name in _logical_fields_for_table(dataframe):
+            if logical_name not in output_fields:
+                output_fields.append(logical_name)
+
     tables = [
-        _canonicalize_table(spark.table(table_name), table_name, priority)
-        for priority, table_name in enumerate(prioritized_tables, start=1)
+        _canonicalize_table(frame, table_name, priority, output_fields)
+        for priority, (table_name, frame) in enumerate(zip(prioritized_tables, source_frames), start=1)
     ]
     view_names = [f"mdm_source_{uuid4().hex}" for _ in tables]
     for view_name, table in zip(view_names, tables):
@@ -283,41 +338,53 @@ def build_mdm(
     }
     prioritized_metadata = resolve_prioritized_metadata(metadata_by_source, source_names)
     metadata_by_field = {
-        classify_column(item["column_name"]): item for item in prioritized_metadata
+        _canonical_output_name(item["column_name"], classify_column(item["column_name"])): item
+        for item in prioritized_metadata
     }
+    field_order = list(dict.fromkeys(
+        _canonical_output_name(item["column_name"], classify_column(item["column_name"]))
+        for item in prioritized_metadata
+    ))
+    matching_fields = [field for field in field_order if field in MATCH_COLUMNS or field.endswith("_id") or field == "record_id"]
+    values_to_select = [field for field in field_order if field not in {"source_payload", "source_table", "source_priority", "source_row_id"}]
+
     pairs = _splink_pairs(mdm_temp, spark, match_probability_threshold, selected_match_columns)
     clustered = _add_entity_ids(mdm_temp, pairs)
     selected_internal = [
-        _priority_value(clustered, column).alias(f"_selected_{column}")
-        for column in MATCH_COLUMNS
-        if column in selected_match_columns
+        _priority_value(clustered, field).alias(f"_selected_{field}")
+        for field in values_to_select
+        if field in clustered.columns
     ]
     conflict_internal = [
-        _conflicting_values(clustered, column).alias(f"_conflicts_{column.lower()}")
-        for column in MATCH_COLUMNS
-        if column in selected_match_columns
+        _conflicting_values(clustered, field).alias(f"_conflicts_{field}")
+        for field in values_to_select
+        if field in clustered.columns and field in selected_match_columns or field.endswith("_id")
     ]
     final = clustered.groupBy("component_id").agg(
         *selected_internal,
         *conflict_internal,
-        _priority_value(clustered, "record_id").alias("_selected_record_id"),
         F.sort_array(F.collect_list(F.col("source_payload"))).alias("source_records"),
         F.count("source_row_id").alias("source_record_count"),
     ).withColumnRenamed("component_id", "entity_id")
 
     output_columns = []
-    for internal_name in (*selected_match_columns, "record_id"):
-        category = "ID" if internal_name == "record_id" else classify_column(internal_name)
-        metadata = metadata_by_field.get(category)
+    for internal_name in values_to_select:
+        metadata = metadata_by_field.get(internal_name)
         data_type = metadata["data_type"] if metadata else "string"
         output_columns.append(
             F.col(f"_selected_{internal_name}").cast(data_type).alias(internal_name)
         )
 
+    conflict_columns = [
+        F.col(f"_conflicts_{field}")
+        for field in values_to_select
+        if field in clustered.columns and (field in selected_match_columns or field.endswith("_id"))
+    ]
+
     final = final.select(
         "entity_id",
         *output_columns,
-        *[f"_conflicts_{column.lower()}" for column in selected_match_columns],
+        *conflict_columns,
         "source_records",
         "source_record_count",
     )
